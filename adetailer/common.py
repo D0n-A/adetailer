@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -14,6 +15,22 @@ from rich import print  # noqa: A004  Shadowing built-in 'print'
 from torchvision.transforms.functional import to_pil_image
 
 REPO_ID = "Bingsu/adetailer"
+
+DEFAULT_PT_MODELS = (
+    "face_yolov8n.pt",
+    "face_yolov8s.pt",
+    "hand_yolov8n.pt",
+    "person_yolov8n-seg.pt",
+    "person_yolov8s-seg.pt",
+    "yolov8x-worldv2.pt",
+)
+
+DEFAULT_MEDIAPIPE_MODELS = {
+    "mediapipe_face_full": "mediapipe_face_full",
+    "mediapipe_face_short": "mediapipe_face_short",
+    "mediapipe_face_mesh": "mediapipe_face_mesh",
+    "mediapipe_face_mesh_eyes_only": "mediapipe_face_mesh_eyes_only",
+}
 
 T = TypeVar("T", int, float)
 
@@ -78,43 +95,95 @@ def download_models(*names: str, check_remote: bool = True) -> dict[str, str]:
 
 
 def get_models(
-    *dirs: str | os.PathLike[str], huggingface: bool = True
+    *dirs: str | os.PathLike[str],
+    huggingface: bool = True,
+    extra_key_mode: str = "legacy",
+    include_conflicting_models: bool = False,
+    warn_on_skipped: bool = False,
 ) -> OrderedDict[str, str]:
-    model_paths = []
-
-    for dir_ in dirs:
-        if not dir_:
-            continue
-        model_paths.extend(scan_model_dir(Path(dir_)))
-
     models = OrderedDict()
-    to_download = [
-        "face_yolov8n.pt",
-        "face_yolov8s.pt",
-        "hand_yolov8n.pt",
-        "person_yolov8n-seg.pt",
-        "person_yolov8s-seg.pt",
-        "yolov8x-worldv2.pt",
-    ]
-    models.update(download_models(*to_download, check_remote=huggingface))
+    models.update(download_models(*DEFAULT_PT_MODELS, check_remote=huggingface))
 
-    models.update(
-        {
-            "mediapipe_face_full": "mediapipe_face_full",
-            "mediapipe_face_short": "mediapipe_face_short",
-            "mediapipe_face_mesh": "mediapipe_face_mesh",
-            "mediapipe_face_mesh_eyes_only": "mediapipe_face_mesh_eyes_only",
-        }
-    )
+    models.update(DEFAULT_MEDIAPIPE_MODELS)
 
     invalid_keys = [k for k, v in models.items() if v == "INVALID"]
     for key in invalid_keys:
         models.pop(key)
 
-    for path in model_paths:
-        if path.name in models:
+    scan_dirs: list[Path] = []
+    for dir_ in dirs:
+        if not dir_:
             continue
-        models[path.name] = str(path)
+
+        dir_str = str(dir_).strip()
+        if not dir_str:
+            continue
+        scan_dirs.append(Path(dir_str))
+
+    skipped: list[str] = []
+
+    def extra_namespace(i: int) -> str:
+        # i is 1-based index within extra dirs
+        return "extra" if i == 1 else f"extra{i}"
+
+    for dir_idx, base_dir in enumerate(scan_dirs):
+        is_extra = dir_idx > 0
+        extra_idx = dir_idx  # 1..N for extra dirs
+
+        if not base_dir.is_dir():
+            if warn_on_skipped:
+                skipped.append(f"dir not found: {base_dir}")
+            continue
+
+        # Collect root models (always), then add subfolder models if they exist.
+        root_files = [p for p in base_dir.glob("*.pt") if p.is_file()]
+        root_files.sort(key=lambda p: p.name)
+
+        subdir_files = (
+            [p for p in scan_model_dir(base_dir) if p.parent != base_dir]
+            if any(item.is_dir() for item in base_dir.iterdir())
+            else []
+        )
+        subdir_files.sort(key=lambda p: p.relative_to(base_dir).as_posix())
+
+        has_subdir_models = bool(subdir_files)
+        model_paths = [*root_files, *subdir_files] if has_subdir_models else root_files
+
+        for path in model_paths:
+            rel_key = (
+                path.relative_to(base_dir).as_posix()
+                if has_subdir_models and path.parent != base_dir
+                else path.name
+            )
+
+            key = rel_key
+
+            if is_extra:
+                mode = (extra_key_mode or "legacy").lower()
+                ns = extra_namespace(extra_idx)
+                if mode == "prefix":
+                    key = f"{ns}/{rel_key}"
+                elif mode == "auto" and key in models:
+                    key = f"{ns}/{rel_key}"
+
+            if key in models:
+                if include_conflicting_models and not is_extra:
+                    conflict_key = f"local/{rel_key}"
+                    if conflict_key in models:
+                        if warn_on_skipped:
+                            skipped.append(f"duplicate key: {conflict_key} -> {path}")
+                        continue
+                    key = conflict_key
+                else:
+                    if warn_on_skipped:
+                        skipped.append(f"duplicate key: {key} -> {path}")
+                    continue
+            models[key] = str(path)
+
+    if warn_on_skipped and skipped:
+        print("[-] ADetailer: Skipped models while scanning:", file=sys.stderr)
+        for line in skipped:
+            print(f"  - {line}", file=sys.stderr)
 
     return models
 

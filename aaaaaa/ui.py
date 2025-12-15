@@ -54,7 +54,8 @@ class Widgets(SimpleNamespace):
 
 @dataclass
 class WebuiInfo:
-    ad_model_list: list[str]
+    # Can be list[str] or list[tuple[label, value]] for gr.Dropdown
+    ad_model_list: list[Any]
     sampler_names: list[str]
     scheduler_names: list[str]
     t2i_button: gr.Button
@@ -173,10 +174,17 @@ def one_ui_group(n: int, is_img2img: bool, webui_info: WebuiInfo):
     w = Widgets()
     eid = partial(elem_id, n=n, is_img2img=is_img2img)
 
+    tuple_mode = bool(webui_info.ad_model_list) and isinstance(
+        webui_info.ad_model_list[0], tuple
+    )
+    none_choice: Any = ("None", "None") if tuple_mode else "None"
     model_choices = (
-        [*webui_info.ad_model_list, "None"]
+        [*webui_info.ad_model_list, none_choice]
         if n == 0
-        else ["None", *webui_info.ad_model_list]
+        else [none_choice, *webui_info.ad_model_list]
+    )
+    default_value = (
+        model_choices[0][1] if tuple_mode and isinstance(model_choices[0], tuple) else model_choices[0]
     )
 
     with gr.Group():
@@ -192,7 +200,7 @@ def one_ui_group(n: int, is_img2img: bool, webui_info: WebuiInfo):
             w.ad_model = gr.Dropdown(
                 label="ADetailer detector" + suffix(n),
                 choices=model_choices,
-                value=model_choices[0],
+                value=default_value,
                 visible=True,
                 type="value",
                 elem_id=eid("ad_model"),
