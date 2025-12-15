@@ -93,6 +93,13 @@ YOLO World model: https://docs.ultralytics.com/models/yolo-world/
 
 Put your [ultralytics](https://github.com/ultralytics/ultralytics) yolo model in `models/adetailer`. The model name should end with `.pt`.
 
+Subfolders under `models/adetailer` are supported. Models inside subfolders will appear with their relative path (e.g. `bbox/face.pt`).
+
+You can also scan additional folders via Settings → ADetailer → `Extra paths to scan adetailer models...`.
+If you use multiple folders or have name collisions, check Settings → ADetailer → `Extra models key mode`.
+For display only, check Settings → ADetailer → `Extra models label display mode`.
+For advanced display customization (label only), check Settings → ADetailer → `ADetailer model label template (advanced)`.
+
 It must be a bbox detection or segment model and use all label.
 
 ## How it works

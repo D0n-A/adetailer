@@ -50,6 +50,7 @@ from adetailer.args import (
     SkipImg2ImgOrig,
 )
 from adetailer.common import PredictOutput, ensure_pil_image, safe_mkdir
+from adetailer.common import DEFAULT_MEDIAPIPE_MODELS, DEFAULT_PT_MODELS
 from adetailer.mask import (
     filter_by_ratio,
     filter_k_by,
@@ -88,11 +89,221 @@ adetailer_dir = Path(paths.models_path, "adetailer")
 safe_mkdir(adetailer_dir)
 
 extra_models_dirs = shared.opts.data.get("ad_extra_models_dir", "")
+extra_key_mode = opts.data.get("ad_extra_models_key_mode", "legacy")
+include_conflicting_models = opts.data.get("ad_include_conflicting_models", False)
+warn_on_skipped = opts.data.get("ad_warn_on_skipped_models", False)
 model_mapping = get_models(
     adetailer_dir,
     *extra_models_dirs.split("|"),
     huggingface=not no_huggingface,
+    extra_key_mode=extra_key_mode,
+    include_conflicting_models=include_conflicting_models,
+    warn_on_skipped=warn_on_skipped,
 )
+
+STANDARD_AD_MODELS = {*DEFAULT_PT_MODELS, *DEFAULT_MEDIAPIPE_MODELS}
+STANDARD_AD_MODELS_LOWER = {m.lower() for m in STANDARD_AD_MODELS}
+STANDARD_AD_PT_MODELS_LOWER = {m.lower() for m in STANDARD_AD_MODELS if m.lower().endswith(".pt")}
+
+
+def _safe_resolve(path: Path) -> Path:
+    try:
+        return path.resolve(strict=False)
+    except Exception:
+        return path
+
+
+def _try_relative_to(path: Path, parent: Path) -> str | None:
+    try:
+        return _safe_resolve(path).relative_to(_safe_resolve(parent)).as_posix()
+    except Exception:
+        return None
+
+
+def build_ad_model_choices(model_mapping_: dict[str, str]) -> list[Any]:
+    """
+    Returns choices for gr.Dropdown:
+    - default: list[str]
+    - if ad_mark_duplicates: list[tuple[label, value]] (value is stable key, label may include ' (D)')
+    """
+
+    keys = list(model_mapping_.keys())
+
+    label_mode = (opts.data.get("ad_model_label_mode", "smart") or "smart").lower()
+    extra_label_mode = (
+        opts.data.get("ad_extra_model_label_mode", "default") or "default"
+    ).lower()
+    label_template = str(opts.data.get("ad_model_label_template", "") or "").strip()
+    dup_marker = str(opts.data.get("ad_duplicate_marker", " (D)") or " (D)")
+    show_duplicates = opts.data.get("ad_mark_duplicates", False)
+
+    # If nothing changes, return a plain list for maximum compatibility.
+    if (
+        not show_duplicates
+        and label_mode == "default"
+        and extra_label_mode == "default"
+        and not label_template
+    ):
+        return keys
+
+    # Pre-calc which keys point to local models under models/adetailer
+    local_rel_by_key: dict[str, str] = {}
+    has_local_subdir_models = False
+    for key in keys:
+        if key.lower() in STANDARD_AD_MODELS_LOWER:
+            continue
+        if not key.lower().endswith(".pt"):
+            continue
+        rel = _try_relative_to(Path(model_mapping_[key]), adetailer_dir)
+        if rel is None:
+            continue
+        local_rel_by_key[key] = rel
+        if "/" in rel:
+            has_local_subdir_models = True
+
+    # Pre-calc which keys point to extra models under user-provided extra paths
+    extra_rel_by_key: dict[str, tuple[str, str]] = {}
+    extra_dirs_list = [
+        Path(p.strip())
+        for p in str(extra_models_dirs).split("|")
+        if p and str(p).strip()
+    ]
+
+    def extra_ns(i: int) -> str:
+        return "extra" if i == 1 else f"extra{i}"
+
+    for key in keys:
+        if key.lower() in STANDARD_AD_MODELS_LOWER:
+            continue
+        if not key.lower().endswith(".pt"):
+            continue
+        value = model_mapping_.get(key, "")
+        if not value:
+            continue
+        value_path = Path(value)
+        if _try_relative_to(value_path, adetailer_dir) is not None:
+            continue  # local
+        for i, extra_dir in enumerate(extra_dirs_list, 1):
+            rel = _try_relative_to(value_path, extra_dir)
+            if rel is None:
+                continue
+            extra_rel_by_key[key] = (extra_ns(i), rel)
+            break
+
+    present_standard_pt_names_lower = {
+        k.lower() for k in keys if k.lower() in STANDARD_AD_PT_MODELS_LOWER
+    }
+
+    user_pt_name_counts: dict[str, int] = {}
+    for key in keys:
+        if key.lower() in STANDARD_AD_MODELS_LOWER:
+            continue
+        if not key.lower().endswith(".pt"):
+            continue
+        filename_lower = Path(key).name.lower()
+        user_pt_name_counts[filename_lower] = user_pt_name_counts.get(filename_lower, 0) + 1
+
+    duplicate_user_pt_names_lower = {
+        name for name, count in user_pt_name_counts.items() if count > 1
+    }
+
+    mediapipe_keys_lower = {k.lower() for k in DEFAULT_MEDIAPIPE_MODELS}
+    standard_pt_keys_lower = {k.lower() for k in DEFAULT_PT_MODELS}
+
+    choices: list[tuple[str, str]] = []
+    for key in keys:
+        local_rel = local_rel_by_key.get(key)
+        extra_info = extra_rel_by_key.get(key)
+
+        base_label = key
+
+        # Display mode (label only; value stays as key)
+        if local_rel is not None:
+            if label_mode == "absolute":
+                base_label = model_mapping_[key]
+            elif label_mode == "models":
+                base_label = f"models/adetailer/{local_rel}"
+            elif label_mode == "dots":
+                base_label = f".../adetailer/{local_rel}"
+            elif label_mode == "smart":
+                if has_local_subdir_models:
+                    base_label = f"adetailer/{local_rel}"
+            elif label_mode == "adetailer":
+                base_label = f"adetailer/{local_rel}"
+        elif extra_info is not None:
+            extra_ns, extra_rel = extra_info
+            if extra_label_mode == "absolute":
+                base_label = model_mapping_[key]
+            elif extra_label_mode == "dots":
+                base_label = f".../{extra_ns}/{extra_rel}"
+            elif extra_label_mode == "namespace":
+                base_label = f"{extra_ns}/{extra_rel}"
+
+        is_user_pt = key.lower() not in STANDARD_AD_MODELS_LOWER and key.lower().endswith(
+            ".pt"
+        )
+        is_dup = False
+        if show_duplicates and is_user_pt:
+            filename_lower = Path(key).name.lower()
+            if (
+                filename_lower in present_standard_pt_names_lower
+                or filename_lower in duplicate_user_pt_names_lower
+            ):
+                is_dup = True
+
+        dup = dup_marker if (show_duplicates and is_dup) else ""
+
+        # Template-based label (label only; value stays as key)
+        if label_template:
+            if key.lower() in mediapipe_keys_lower:
+                source = "mediapipe"
+                ns = "mediapipe"
+                rel = key
+            elif key.lower() in standard_pt_keys_lower:
+                source = "standard"
+                ns = "standard"
+                rel = key
+            elif local_rel is not None:
+                source = "local"
+                ns = "adetailer"
+                rel = local_rel
+            elif extra_info is not None:
+                source = "extra"
+                ns, rel = extra_info
+            else:
+                source = "other"
+                ns = ""
+                rel = key
+
+            fields: dict[str, Any] = {
+                "label": base_label,
+                "key": key,
+                "path": model_mapping_.get(key, ""),
+                "value": model_mapping_.get(key, ""),
+                "source": source,
+                "ns": ns,
+                "rel": rel,
+                "name": Path(rel).name,
+                "dup": dup,
+                "is_dup": is_dup,
+                "dup_marker": dup_marker,
+            }
+
+            try:
+                label = label_template.format_map(fields)
+            except Exception:
+                label = base_label
+
+            # If the template doesn't reference {dup}, keep the old behavior: append it.
+            if dup and "{dup" not in label_template and not label.endswith(dup):
+                label = f"{label}{dup}"
+        else:
+            label = f"{base_label}{dup}"
+
+        choices.append((label, key))
+
+    return cast(list[Any], choices)
+
 
 txt2img_submit_button = img2img_submit_button = None
 txt2img_submit_button = cast(gr.Button, txt2img_submit_button)
@@ -121,7 +332,7 @@ class AfterDetailerScript(scripts.Script):
 
     def ui(self, is_img2img):
         num_models = opts.data.get("ad_max_models", 2)
-        ad_model_list = list(model_mapping.keys())
+        ad_model_list = build_ad_model_choices(model_mapping)
         sampler_names = [sampler.name for sampler in all_samplers]
         scheduler_names = [x.label for x in schedulers]
 
@@ -961,6 +1172,117 @@ def on_ui_settings():
             section=section,
         )
         .info("eg. path\\to\\models|C:\\path\\to\\models|another/path/to/models")
+        .needs_reload_ui(),
+    )
+
+    shared.opts.add_option(
+        "ad_extra_models_key_mode",
+        shared.OptionInfo(
+            default="legacy",
+            label="Extra models key mode",
+            component=gr.Radio,
+            component_args={"choices": ["legacy", "auto", "prefix"]},
+            section=section,
+        )
+        .info("legacy: keep keys as-is (may hide duplicates); auto: prefix only on conflicts; prefix: always prefix extra models as extra/...; requires UI reload")
+        .needs_reload_ui(),
+    )
+
+    shared.opts.add_option(
+        "ad_include_conflicting_models",
+        shared.OptionInfo(
+            default=False,
+            label="Include local models that conflict with standard names as local/...",
+            section=section,
+        )
+        .info("If enabled, local models with conflicting keys will be added as local/... instead of being skipped; requires UI reload")
+        .needs_reload_ui(),
+    )
+
+    shared.opts.add_option(
+        "ad_warn_on_skipped_models",
+        shared.OptionInfo(
+            default=False,
+            label="Log skipped models while scanning",
+            section=section,
+        )
+        .info("Prints skipped models (duplicate keys / missing dirs) to console during UI load")
+        .needs_reload_ui(),
+    )
+
+    shared.opts.add_option(
+        "ad_mark_duplicates",
+        shared.OptionInfo(
+            default=False,
+            label="Mark duplicate model names with (D) in dropdown",
+            section=section,
+        ).needs_reload_ui(),
+    )
+
+    shared.opts.add_option(
+        "ad_duplicate_marker",
+        shared.OptionInfo(
+            default=" (D)",
+            label="Duplicate marker text",
+            component=gr.Textbox,
+            component_args={"placeholder": " (D)"},
+            section=section,
+        )
+        .info("Used for {dup} in label template and for marking duplicates; requires UI reload")
+        .needs_reload_ui(),
+    )
+
+    shared.opts.add_option(
+        "ad_model_label_template",
+        shared.OptionInfo(
+            default="",
+            label="ADetailer model label template (advanced)",
+            component=gr.Textbox,
+            component_args={"placeholder": "{label}{dup}"},
+            section=section,
+        )
+        .info(
+            "Python format string. Vars: {label}, {key}, {path}, {source}, {ns}, {rel}, {name}, {dup}, {is_dup}. "
+            "If blank, label modes are used."
+        )
+        .needs_reload_ui(),
+    )
+
+    shared.opts.add_option(
+        "ad_model_label_mode",
+        shared.OptionInfo(
+            default="smart",
+            label="ADetailer model label display mode",
+            component=gr.Radio,
+            component_args={"choices": ["smart", "default", "adetailer", "models", "dots", "absolute"]},
+            section=section,
+        )
+        .info(
+            "smart: show 'adetailer/...' only when subfolder models exist; "
+            "default: show keys; "
+            "adetailer: always show 'adetailer/...' for local models; "
+            "models: show 'models/adetailer/...'; "
+            "dots: show '.../adetailer/...'; "
+            "absolute: show absolute file paths (local models only)"
+        )
+        .needs_reload_ui(),
+    )
+
+    shared.opts.add_option(
+        "ad_extra_model_label_mode",
+        shared.OptionInfo(
+            default="default",
+            label="Extra models label display mode",
+            component=gr.Radio,
+            component_args={"choices": ["default", "namespace", "dots", "absolute"]},
+            section=section,
+        )
+        .info(
+            "default: show keys; "
+            "namespace: show extra/..., extra2/... based on which extra path contains the file; "
+            "dots: show .../extra/...; "
+            "absolute: show absolute file paths (extra models only)"
+        )
         .needs_reload_ui(),
     )
 
